@@ -1,0 +1,429 @@
+// Register service worker
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
+}
+
+// ── State ──────────────────────────────────────────────────────────────────
+let trig = 'arrive', dtrig = 'arrive';
+let watchId = null, currentPos = null, map = null, mapReady = false, activeFilter = 'all';
+let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+let nextId = (reminders.reduce((m, r) => Math.max(m, r.id), 0) || 0) + 1;
+let toastTimer, userMarker = null, shopMarkers = [], allShops = [], drawerShop = null;
+let suggestTimer = null, suggestions = [], currentSugIdx = 0;
+
+// ── Shop config ────────────────────────────────────────────────────────────
+const SHOP_TYPES = {
+  supermarket: { label: 'Supermarket', color: '#2A5EC4', bg: '#EEF3FD', icon: 'ti-basket',      mapColor: '#5B8DEF', osm: 'shop=supermarket' },
+  pharmacy:    { label: 'Pharmacy',    color: '#2E7D5C', bg: '#EBF7F2', icon: 'ti-pill',        mapColor: '#5DBD8A', osm: 'amenity=pharmacy' },
+  convenience: { label: 'Convenience', color: '#854F0B', bg: '#FDF4E4', icon: 'ti-shopping-bag',mapColor: '#F0B45A', osm: 'shop=convenience' },
+  bakery:      { label: 'Bakery',      color: '#A8452A', bg: '#FDF0EC', icon: 'ti-bread',       mapColor: '#EF8A6F', osm: 'shop=bakery' },
+  clothing:    { label: 'Clothing',    color: '#5C4FB5', bg: '#F0EEFE', icon: 'ti-hanger',      mapColor: '#9B8FEF', osm: 'shop=clothes' },
+};
+
+const PRODUCT_MAP = {
+  paracetamol:    { type: 'pharmacy',     confidence: 98, reason: 'Stocked at all pharmacies and chemists' },
+  ibuprofen:      { type: 'pharmacy',     confidence: 97, reason: 'Available at pharmacies over the counter' },
+  aspirin:        { type: 'pharmacy',     confidence: 95, reason: 'Standard pharmacy stock' },
+  prescription:   { type: 'pharmacy',     confidence: 99, reason: 'Prescriptions require a registered pharmacy' },
+  medicine:       { type: 'pharmacy',     confidence: 90, reason: 'Medicines are reliably found at pharmacies' },
+  vitamins:       { type: 'pharmacy',     confidence: 88, reason: 'Full vitamin range at pharmacies' },
+  sunscreen:      { type: 'pharmacy',     confidence: 85, reason: 'Sun care products well stocked at chemists' },
+  plasters:       { type: 'pharmacy',     confidence: 92, reason: 'First aid items are a pharmacy staple' },
+  bread:          { type: 'bakery',       confidence: 96, reason: 'Freshest bread comes from a bakery' },
+  sourdough:      { type: 'bakery',       confidence: 98, reason: 'Artisan sourdough is a bakery speciality' },
+  croissant:      { type: 'bakery',       confidence: 97, reason: 'Fresh pastries baked on site daily' },
+  cake:           { type: 'bakery',       confidence: 95, reason: 'Cakes and baked goods are a bakery staple' },
+  pastry:         { type: 'bakery',       confidence: 94, reason: 'Bakeries bake pastries fresh every morning' },
+  loaf:           { type: 'bakery',       confidence: 96, reason: 'Freshly baked loaves direct from the bakery' },
+  milk:           { type: 'supermarket',  confidence: 99, reason: 'Dairy essentials at every supermarket' },
+  eggs:           { type: 'supermarket',  confidence: 99, reason: 'Fresh eggs are a supermarket staple' },
+  butter:         { type: 'supermarket',  confidence: 98, reason: 'Dairy is well stocked at supermarkets' },
+  cheese:         { type: 'supermarket',  confidence: 96, reason: 'Wide cheese selection at supermarkets' },
+  chicken:        { type: 'supermarket',  confidence: 97, reason: 'Fresh meat and poultry at supermarkets' },
+  pasta:          { type: 'supermarket',  confidence: 98, reason: 'Dry goods stocked at supermarkets' },
+  rice:           { type: 'supermarket',  confidence: 98, reason: 'Staple grains are at supermarkets' },
+  wine:           { type: 'supermarket',  confidence: 94, reason: 'Alcohol stocked at supermarkets' },
+  beer:           { type: 'supermarket',  confidence: 93, reason: 'Alcohol stocked at supermarkets' },
+  coffee:         { type: 'supermarket',  confidence: 92, reason: 'Coffee beans and pods at supermarkets' },
+  snacks:         { type: 'convenience',  confidence: 90, reason: 'Quick snacks at convenience stores' },
+  crisps:         { type: 'convenience',  confidence: 91, reason: 'Snacks and crisps at convenience stores' },
+  chocolate:      { type: 'convenience',  confidence: 88, reason: 'Confectionery at newsagents and convenience stores' },
+  newspaper:      { type: 'convenience',  confidence: 95, reason: 'Press and papers at newsagents' },
+  magazine:       { type: 'convenience',  confidence: 93, reason: 'Magazines at newsagents' },
+  batteries:      { type: 'convenience',  confidence: 85, reason: 'Convenience stores carry household basics' },
+  'energy drink': { type: 'convenience',  confidence: 92, reason: 'Cold drinks at convenience stores' },
+  socks:          { type: 'clothing',     confidence: 90, reason: 'Clothing stores and department stores' },
+  jacket:         { type: 'clothing',     confidence: 95, reason: 'Outerwear found at clothing stores' },
+  jeans:          { type: 'clothing',     confidence: 96, reason: 'Denim is a clothing store staple' },
+  dress:          { type: 'clothing',     confidence: 96, reason: 'Dresses are found at clothing boutiques' },
+  jumper:         { type: 'clothing',     confidence: 93, reason: 'Knitwear stocked at clothing stores' },
+  shoes:          { type: 'clothing',     confidence: 92, reason: 'Footwear shops and clothing stores' },
+};
+
+const FALLBACK_ORDER = ['supermarket', 'pharmacy', 'convenience', 'bakery', 'clothing'];
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function saveReminders() { localStorage.setItem('reminders', JSON.stringify(reminders)); }
+function haversine(a, b, c, d) {
+  const R = 6371000, dL = (c-a)*Math.PI/180, dN = (d-b)*Math.PI/180;
+  const x = Math.sin(dL/2)**2 + Math.cos(a*Math.PI/180)*Math.cos(c*Math.PI/180)*Math.sin(dN/2)**2;
+  return R*2*Math.atan2(Math.sqrt(x), Math.sqrt(1-x));
+}
+let toastT2;
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastT2); toastT2 = setTimeout(() => t.classList.remove('show'), 2800);
+}
+function matchProduct(text) {
+  const t = text.toLowerCase();
+  for (const [kw, v] of Object.entries(PRODUCT_MAP)) { if (t.includes(kw)) return v; }
+  return null;
+}
+
+// ── Tabs ───────────────────────────────────────────────────────────────────
+function switchTab(id, btn) {
+  document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(t => t.classList.remove('active'));
+  document.getElementById('pane-' + id).classList.add('active');
+  btn.classList.add('active');
+  if (id === 'map' && currentPos && !mapReady) buildMap();
+}
+
+// ── Trigger buttons ────────────────────────────────────────────────────────
+function setTrig(t) { trig = t; ['arrive','leave','both'].forEach(x => document.getElementById('tag-'+x).className = 'trig-btn' + (x===t ? ' sel-'+t : '')); }
+function setDTrig(t) { dtrig = t; ['arrive','leave','both'].forEach(x => document.getElementById('dtag-'+x).className = 'trig-btn' + (x===t ? ' sel-'+t : '')); }
+
+// ── Location ───────────────────────────────────────────────────────────────
+function toggleSpecificLoc() {
+  const c = document.getElementById('specificLoc').checked;
+  document.getElementById('specificLocFields').style.display = c ? 'block' : 'none';
+  if (!c) { suggestions = []; currentSugIdx = 0; document.getElementById('aiSuggest').innerHTML = ''; onReminderInput(); }
+  updateAddBtn();
+}
+
+function useMyLoc() {
+  if (!navigator.geolocation) { toast('Geolocation not supported'); return; }
+  navigator.geolocation.getCurrentPosition(p => {
+    currentPos = { lat: p.coords.latitude, lng: p.coords.longitude };
+    document.getElementById('locName').value = 'My current location';
+    document.getElementById('locName').dataset.lat = currentPos.lat;
+    document.getElementById('locName').dataset.lng = currentPos.lng;
+    startTracking(); toast('Location captured');
+  }, () => toast('Could not get location'));
+}
+
+function startTracking() {
+  if (watchId || !navigator.geolocation) return;
+  document.getElementById('sdot').className = 'sdot on';
+  document.getElementById('stext').textContent = 'Live';
+  watchId = navigator.geolocation.watchPosition(p => {
+    currentPos = { lat: p.coords.latitude, lng: p.coords.longitude };
+    document.getElementById('sdot').className = 'sdot on';
+    document.getElementById('stext').textContent = 'Live';
+    if (mapReady && userMarker) userMarker.setLatLng([currentPos.lat, currentPos.lng]);
+    checkGeofences();
+  }, () => {}, { enableHighAccuracy: true });
+}
+
+// ── Geofence checking ──────────────────────────────────────────────────────
+const wasInside = {};
+function checkGeofences() {
+  if (!currentPos) return;
+  reminders.forEach(r => {
+    if (!r.active) return;
+    const inside = haversine(currentPos.lat, currentPos.lng, r.lat, r.lng) <= r.radius;
+    const prev = wasInside[r.id];
+    if (prev === undefined) { wasInside[r.id] = inside; return; }
+    if (inside && !prev && (r.trigger === 'arrive' || r.trigger === 'both')) notify(r, 'arrive');
+    if (!inside && prev && (r.trigger === 'leave' || r.trigger === 'both')) notify(r, 'leave');
+    wasInside[r.id] = inside;
+  });
+}
+
+function notify(r, type) {
+  const title = type === 'arrive' ? `Arriving at ${r.location}` : `Leaving ${r.location}`;
+  if ('Notification' in window && Notification.permission === 'granted') {
+    new Notification(title, { body: r.text, icon: '/icon-192.png' });
+  } else {
+    toast(`${type === 'arrive' ? '📍' : '🚶'} ${title}: ${r.text}`);
+  }
+}
+
+// Request notification permission on first reminder add
+function requestNotifPermission() {
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
+
+// ── AI suggestions ─────────────────────────────────────────────────────────
+function onReminderInput() {
+  updateAddBtn();
+  clearTimeout(suggestTimer);
+  const txt = document.getElementById('rText').value.trim();
+  const specific = document.getElementById('specificLoc').checked;
+  if (specific || !txt) { document.getElementById('aiSuggest').innerHTML = ''; suggestions = []; currentSugIdx = 0; updateAddBtn(); return; }
+  suggestTimer = setTimeout(() => runSuggestion(txt), 500);
+}
+
+async function runSuggestion(txt) {
+  const el = document.getElementById('aiSuggest');
+  const match = matchProduct(txt);
+  el.innerHTML = `<div class="ai-thinking"><i class="ti ti-sparkles" style="font-size:16px;color:var(--blue)"></i><span style="flex:1">Finding the best shops…</span><div class="dot-flashing"><span></span><span></span><span></span></div></div>`;
+
+  let ranked = [];
+  if (match) {
+    ranked = buildRankedSuggestions(match.type, match.confidence, match.reason);
+  } else {
+    const ai = await askClaude(txt);
+    if (ai) ranked = buildRankedSuggestions(ai.shopType, ai.confidence || 80, ai.reason);
+  }
+  if (!ranked.length) { el.innerHTML = ''; updateAddBtn(); return; }
+  suggestions = ranked; currentSugIdx = 0;
+  renderSuggestions();
+}
+
+function buildRankedSuggestions(bestType, bestConf, bestReason) {
+  const results = [];
+  const primary = allShops.filter(s => s.type === bestType);
+  if (primary.length) results.push({ ...primary[0], confidence: bestConf, reason: bestReason, rank: 1 });
+  for (const t of FALLBACK_ORDER.filter(t => t !== bestType)) {
+    const shops = allShops.filter(s => s.type === t);
+    if (shops.length && results.length < 3) {
+      const cfg = SHOP_TYPES[t];
+      results.push({ ...shops[0], confidence: Math.max(20, bestConf - 30 - results.length*10), reason: `${cfg.label}s may also carry this product`, rank: results.length + 1 });
+    }
+  }
+  if (!results.length && allShops.length) results.push({ ...allShops[0], confidence: 40, reason: 'No specialist shop nearby — this is the closest option', rank: 1 });
+  return results;
+}
+
+async function askClaude(txt) {
+  try {
+    const ctx = allShops.slice(0,10).map(s => `${s.name} (${SHOP_TYPES[s.type]?.label||s.type}, ${s.dist}m)`).join(', ');
+    const prompt = `A user in the UK wants to buy: "${txt}". Nearby shops: ${ctx||'various shops'}. Reply ONLY with JSON: {"shopType":"supermarket","confidence":85,"reason":"One sentence reason"}. shopType must be one of: supermarket, pharmacy, convenience, bakery, clothing. No other text.`;
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 120, messages: [{ role: 'user', content: prompt }] })
+    });
+    const data = await res.json();
+    const raw = data.content?.map(c => c.text||'').join('').replace(/```json|```/g,'').trim();
+    return JSON.parse(raw);
+  } catch(e) { return null; }
+}
+
+function renderSuggestions() {
+  const el = document.getElementById('aiSuggest');
+  if (!suggestions.length) { el.innerHTML = ''; return; }
+  const s = suggestions[currentSugIdx];
+  const cfg = SHOP_TYPES[s.type] || SHOP_TYPES.convenience;
+  const isBest = currentSugIdx === 0;
+  const rankColors = ['#5B8DEF','#9B8FEF','#5DBD8A'];
+  const barColor = rankColors[currentSugIdx] || '#AEAEB2';
+  const dots = suggestions.map((_, i) => `<div class="dot-ind${i===currentSugIdx?' active':''}" onclick="goSug(${i})"></div>`).join('');
+
+  el.innerHTML = `<div class="suggest-wrap">
+    <div class="suggest-header">
+      <span class="suggest-title"><i class="ti ti-sparkles" style="margin-right:4px;color:var(--blue)"></i>Shop suggestions</span>
+      <div style="display:flex;align-items:center;gap:6px">
+        <button class="nav-btn" onclick="prevSug()" ${currentSugIdx===0?'disabled':''}><i class="ti ti-chevron-left"></i></button>
+        <span style="font-size:13px;color:var(--t2);font-weight:500;min-width:32px;text-align:center">${currentSugIdx+1} / ${suggestions.length}</span>
+        <button class="nav-btn" onclick="nextSug()" ${currentSugIdx===suggestions.length-1?'disabled':''}><i class="ti ti-chevron-right"></i></button>
+      </div>
+    </div>
+    <div class="suggest-card${isBest?' best':''}">
+      <div class="suggest-rank-bar" style="background:${barColor};opacity:0.18"></div>
+      <div class="suggest-body">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+          <div style="width:42px;height:42px;border-radius:12px;background:${cfg.bg};color:${cfg.color};display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0"><i class="ti ${cfg.icon}"></i></div>
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+              <div class="suggest-name">${esc(s.name)}</div>
+              ${isBest?`<span style="font-size:11px;font-weight:700;padding:2px 8px;border-radius:var(--pill);background:var(--blue-bg);color:var(--blue-dk)"><i class="ti ti-star"></i> Best match</span>`:''}
+            </div>
+            <div style="font-size:12px;color:var(--t2);margin-top:2px">${s.dist<1000?s.dist+'m':(s.dist/1000).toFixed(1)+'km'} away · <span style="background:${cfg.bg};color:${cfg.color};font-size:11px;font-weight:600;padding:1px 7px;border-radius:var(--pill)">${cfg.label}</span></div>
+          </div>
+        </div>
+        <div class="suggest-reason">${esc(s.reason)}</div>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <div style="flex:1;min-width:80px">
+            <div class="confidence-bar-bg"><div class="confidence-bar-fill" style="width:${s.confidence}%;background:${barColor}"></div></div>
+            <div class="confidence-label">${s.confidence}% likely to stock this</div>
+          </div>
+          <button class="use-btn" onclick="useSuggestion(${currentSugIdx})" style="background:${barColor}">Use this shop</button>
+        </div>
+      </div>
+    </div>
+    <div class="dots-wrap">${dots}</div>
+  </div>`;
+  updateAddBtn();
+}
+
+function goSug(i) { currentSugIdx = i; renderSuggestions(); }
+function prevSug() { if (currentSugIdx > 0) { currentSugIdx--; renderSuggestions(); } }
+function nextSug() { if (currentSugIdx < suggestions.length-1) { currentSugIdx++; renderSuggestions(); } }
+
+function useSuggestion(idx) {
+  const s = suggestions[idx];
+  if (!s) return;
+  document.getElementById('specificLoc').checked = true;
+  document.getElementById('specificLocFields').style.display = 'block';
+  const el = document.getElementById('locName');
+  el.value = s.name; el.dataset.lat = s.lat; el.dataset.lng = s.lng;
+  updateAddBtn();
+}
+
+function updateAddBtn() {
+  const txt = document.getElementById('rText').value.trim();
+  const specific = document.getElementById('specificLoc').checked;
+  const locFilled = document.getElementById('locName').value.trim();
+  document.getElementById('addBtn').disabled = !(txt && (suggestions.length || (specific && locFilled)));
+}
+
+// ── Reminders CRUD ─────────────────────────────────────────────────────────
+function addReminder(opts) {
+  let txt, loc, lat, lng, rad, tr;
+  if (opts) {
+    txt=opts.text; loc=opts.location; lat=opts.lat; lng=opts.lng; rad=opts.radius; tr=opts.trigger;
+  } else {
+    txt = document.getElementById('rText').value.trim();
+    rad = parseInt(document.getElementById('radSlider').value); tr = trig;
+    if (!txt) { toast('Enter what you need'); return; }
+    const specific = document.getElementById('specificLoc').checked;
+    const locEl = document.getElementById('locName');
+    if (specific) {
+      loc = locEl.value.trim(); if (!loc) { toast('Enter a location'); return; }
+      lat = parseFloat(locEl.dataset.lat) || (currentPos ? currentPos.lat : 51.509);
+      lng = parseFloat(locEl.dataset.lng) || (currentPos ? currentPos.lng : -0.134);
+    } else if (suggestions.length) {
+      const s = suggestions[currentSugIdx];
+      loc = s.name; lat = s.lat; lng = s.lng;
+    } else {
+      loc = 'Any nearby shop';
+      lat = currentPos ? currentPos.lat : 51.509;
+      lng = currentPos ? currentPos.lng : -0.134;
+    }
+    document.getElementById('rText').value = '';
+    locEl.value = ''; delete locEl.dataset.lat; delete locEl.dataset.lng;
+    document.getElementById('specificLoc').checked = false;
+    document.getElementById('specificLocFields').style.display = 'none';
+    document.getElementById('aiSuggest').innerHTML = '';
+    suggestions = []; currentSugIdx = 0;
+  }
+  reminders.push({ id: nextId++, text: txt, location: loc, lat, lng, radius: rad, trigger: tr, active: true });
+  saveReminders(); renderReminders(); toast('Reminder added'); updateAddBtn();
+  requestNotifPermission();
+}
+
+function deleteR(id) { reminders = reminders.filter(r => r.id !== id); saveReminders(); renderReminders(); }
+function toggleR(id) { const r = reminders.find(r => r.id === id); if (r) { r.active = !r.active; saveReminders(); renderReminders(); } }
+
+function renderReminders() {
+  const el = document.getElementById('rList');
+  if (!reminders.length) {
+    el.innerHTML = `<div class="empty-state"><div style="width:56px;height:56px;border-radius:16px;background:var(--blue-bg);display:flex;align-items:center;justify-content:center;font-size:26px;color:var(--blue);margin:0 auto .75rem"><i class="ti ti-bell-off"></i></div><div style="font-size:17px;font-weight:600;color:var(--t1);margin-bottom:4px">No reminders yet</div><div style="font-size:14px;color:var(--t2)">Type what you need and we'll find the best shop</div></div>`;
+    return;
+  }
+  el.innerHTML = reminders.map(r => {
+    const ds = r.trigger==='arrive'?'background:var(--green-bg);color:var(--green)':r.trigger==='leave'?'background:var(--coral-bg);color:var(--coral)':'background:var(--purple-bg);color:var(--purple)';
+    const ico = r.trigger==='arrive'?'ti-login':r.trigger==='leave'?'ti-logout':'ti-arrows-exchange';
+    const pc = r.trigger==='arrive'?'pill-arrive':r.trigger==='leave'?'pill-leave':'pill-both';
+    const pl = r.trigger==='arrive'?'Arriving':r.trigger==='leave'?'Leaving':'Both';
+    return `<div class="r-card"><div class="r-dot" style="${ds}"><i class="ti ${ico}"></i></div><div style="flex:1;min-width:0"><div class="r-title">${esc(r.text)}</div><div class="r-meta"><span><i class="ti ti-map-pin" style="font-size:11px;vertical-align:-1px"></i> ${esc(r.location)}</span><span><i class="ti ti-circle-dashed" style="font-size:11px;vertical-align:-1px"></i> ${r.radius}m</span></div><div style="display:flex;gap:5px;flex-wrap:wrap"><span class="pill ${pc}">${pl}</span><span class="pill ${r.active?'pill-active':'pill-paused'}">${r.active?'Active':'Paused'}</span></div></div><div style="display:flex;flex-direction:column;gap:4px"><button class="icon-btn" onclick="toggleR(${r.id})"><i class="ti ${r.active?'ti-player-pause':'ti-player-play'}"></i></button><button class="icon-btn" onclick="deleteR(${r.id})" style="color:var(--coral)"><i class="ti ti-trash"></i></button></div></div>`;
+  }).join('');
+}
+
+// ── Map ────────────────────────────────────────────────────────────────────
+function initMap() {
+  if (!navigator.geolocation) { buildMap(); return; }
+  navigator.geolocation.getCurrentPosition(p => { currentPos = { lat: p.coords.latitude, lng: p.coords.longitude }; startTracking(); buildMap(); }, () => buildMap());
+}
+
+function buildMap() {
+  const mapEl = document.getElementById('map');
+  mapEl.innerHTML = ''; mapEl.style.height = '320px';
+  const center = currentPos ? [currentPos.lat, currentPos.lng] : [51.509, -0.128];
+  map = L.map(mapEl, { zoomControl: true }).setView(center, 15);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap', maxZoom: 19 }).addTo(map);
+  if (currentPos) userMarker = L.circleMarker(center, { radius: 9, fillColor: '#5B8DEF', fillOpacity: 1, color: '#fff', weight: 2.5 }).addTo(map).bindPopup('You are here');
+  mapReady = true; fetchShops();
+}
+
+function openDrawer(shop) {
+  drawerShop = shop;
+  const cfg = SHOP_TYPES[shop.type] || SHOP_TYPES.convenience;
+  const di = document.getElementById('dIcon');
+  di.style.background = cfg.bg; di.style.color = cfg.color;
+  di.innerHTML = `<i class="ti ${cfg.icon}"></i>`;
+  document.getElementById('dName').textContent = shop.name;
+  document.getElementById('dSub').textContent = cfg.label + ' · ' + (shop.dist < 1000 ? shop.dist+'m' : (shop.dist/1000).toFixed(1)+'km');
+  document.getElementById('dReminderText').value = '';
+  setDTrig('arrive');
+  document.getElementById('dRadSlider').value = 200;
+  document.getElementById('dRadVal').textContent = '200m';
+  document.getElementById('drawerOverlay').classList.add('open');
+  setTimeout(() => document.getElementById('dReminderText').focus(), 120);
+}
+
+function closeDrawer() { document.getElementById('drawerOverlay').classList.remove('open'); drawerShop = null; }
+
+function confirmDrawerReminder() {
+  if (!drawerShop) return;
+  const txt = document.getElementById('dReminderText').value.trim();
+  if (!txt) { document.getElementById('dReminderText').focus(); return; }
+  const rad = parseInt(document.getElementById('dRadSlider').value);
+  addReminder({ text: txt, location: drawerShop.name, lat: drawerShop.lat, lng: drawerShop.lng, radius: rad, trigger: dtrig });
+  closeDrawer();
+  switchTab('reminders', document.querySelectorAll('.tab-btn')[0]);
+}
+
+function setFilter(type, el) {
+  activeFilter = type;
+  document.querySelectorAll('.fchip').forEach(c => c.classList.remove('on'));
+  el.classList.add('on');
+  renderShopList(); updateShopMarkers();
+}
+
+function filteredShops() { return activeFilter === 'all' ? allShops : allShops.filter(s => s.type === activeFilter); }
+
+function fetchShops() {
+  if (!currentPos) { document.getElementById('shopList').innerHTML = '<div class="empty-state"><div style="font-size:14px;color:var(--t2)">Grant location access to see nearby shops.</div></div>'; return; }
+  const { lat, lng } = currentPos;
+  const queries = Object.entries(SHOP_TYPES).map(([, cfg]) => { const [k,v] = cfg.osm.split('='); return `node["${k}"="${v}"](around:1500,${lat},${lng});`; }).join('');
+  fetch(`https://overpass-api.de/api/interpreter?data=[out:json][timeout:10];(${queries});out body;`)
+    .then(r => r.json()).then(data => {
+      allShops = data.elements.filter(e => e.lat && e.lon).map(e => {
+        let type = 'convenience';
+        for (const [t, cfg] of Object.entries(SHOP_TYPES)) { const [k,v] = cfg.osm.split('='); if (e.tags && e.tags[k] === v) { type = t; break; } }
+        return { id: e.id, name: e.tags.name || SHOP_TYPES[type].label, type, lat: e.lat, lng: e.lon, dist: Math.round(haversine(lat, lng, e.lat, e.lon)) };
+      }).sort((a,b) => a.dist - b.dist).slice(0, 30);
+      renderShopList(); updateShopMarkers();
+    }).catch(() => { document.getElementById('shopList').innerHTML = '<div class="empty-state"><div style="font-size:14px;color:var(--t2)">Could not load shop data.</div></div>'; });
+}
+
+function renderShopList() {
+  const shops = filteredShops().slice(0, 8);
+  const el = document.getElementById('shopList');
+  if (!shops.length) { el.innerHTML = '<div class="empty-state"><div style="font-size:14px;color:var(--t2)">No shops found nearby.</div></div>'; return; }
+  el.innerHTML = shops.map((s, i) => {
+    const cfg = SHOP_TYPES[s.type] || SHOP_TYPES.convenience;
+    return `<div class="shop-card" onclick="openDrawer(${JSON.stringify(s).replace(/"/g,'&quot;')})"><div class="shop-num">${i+1}</div><div style="flex:1;min-width:0"><div style="font-size:15px;font-weight:500;color:var(--t1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.name)}</div><div style="font-size:11px;color:var(--t2);margin-top:2px">${s.dist<1000?s.dist+'m':(s.dist/1000).toFixed(1)+'km'} away</div></div><span class="shop-type-pill" style="background:${cfg.bg};color:${cfg.color}">${cfg.label}</span><i class="ti ti-chevron-right" style="font-size:16px;color:var(--t3)"></i></div>`;
+  }).join('');
+}
+
+function updateShopMarkers() {
+  shopMarkers.forEach(m => m.remove()); shopMarkers = [];
+  if (!map) return;
+  filteredShops().slice(0, 20).forEach((s, i) => {
+    const cfg = SHOP_TYPES[s.type] || SHOP_TYPES.convenience;
+    const icon = L.divIcon({ html: `<div style="background:${cfg.mapColor};color:#fff;width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;border:2px solid #fff;cursor:pointer">${i+1}</div>`, iconSize: [28,28], iconAnchor: [14,14], className: '' });
+    const m = L.marker([s.lat, s.lng], { icon }).addTo(map);
+    m.on('click', () => openDrawer(s));
+    shopMarkers.push(m);
+  });
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+renderReminders();
